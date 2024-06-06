@@ -1,0 +1,199 @@
+import rclpy, time
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+from std_msgs.msg import Float32, Int32
+from yolo_msgs.msg import Yolov8Inference
+
+class ColorAndCircleDetection(Node):
+    def __init__(self):
+        super().__init__('color_and_circle_detection')
+        self.get_logger().info("Puzzle catching lights.....")
+        self.bridge = CvBridge()
+        self.cv_image = None
+        self.state = "start"
+        self.vel = 0.0
+        #Declaraciones de subsripción y de publicador de imagen y velocidad del puzzlebot
+        self.sub = self.create_subscription(Image, '/video_source/raw', self.camera_callback, 20)
+        self.sub_inference = self.create_subscription(Yolov8Inference, "/yolov8_inference", self.traffic_signs_callback, 10)
+        self.pub = self.create_publisher(Twist, "/cmd_vel", 1)
+        #Declaraciones de las banderas de las señales de transito
+        self.ahead = 0
+        self.left = 0
+        self.right = 0
+        self.stop = 0
+        self.area = 0
+        #Declaracion de la bandera de la zebra
+        self.zebra = 0
+        self.area_zebra = 0
+        #Declaración de la bandera del estado del semaforo
+        self.semaforo_green = 0
+        self.semaforo_yellow = 0
+        self.semaforo_red = 0
+        self.semaforo_area = 0
+        self.class_name = None
+        #self.publish_vel = self.create_publisher(Int)
+        self.timer = self.create_timer(0.05, self.operations_callback)
+        
+    def camera_callback(self, msg):
+        #Recibimos la imagen capturada por el lente del puzzle y la convertimos para opencv
+        self.cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+    def traffic_signs_callback(self, msg):
+        
+        for element in msg.yolov8_inference:
+            if element.class_name == "ahead_only":
+                self.ahead = 1
+                self.area = (element.bottom - element.top)*(element.right - element.left)
+            if element.class_name == "turn_right_ahead":
+                self.right = 1
+                self.area = (element.bottom - element.top)*(element.right - element.left)
+            if element.class_name == "turn_left_ahead":
+                self.left = 1
+                print(str(self.left))
+                self.area = (element.bottom - element.top)*(element.right - element.left)
+            if element.class_name == "stop":
+                self.stop = 1
+                self.area = (element.bottom - element.top)*(element.right - element.left)
+            if element.class_name == "red":
+                self.semaforo_red = 1
+                self.semaforo_area = (element.bottom - element.top)*(element.right - element.left)
+            if element.class_name == "yellow":
+                self.semaforo_yellow = 1
+                self.semaforo_area = (element.bottom - element.top)*(element.right - element.left)
+            if element.class_name == "green":
+                self.semaforo_green = 1
+                self.semaforo_area = (element.bottom - element.top)*(element.right - element.left)
+            if element.class_name == "zebra'":
+                self.zebra = 1
+                self.area_zebra = (element.bottom - element.top)*(element.right - element.left)
+                print(str(self.area_zebra))
+
+    def operations_callback(self):
+        if self.cv_image is not None:
+            msg = Twist()
+            height, width = self.cv_image.shape[:2]
+    
+            # Define the region of interest (lower fourth of the frame)
+            roi = self.cv_image[height * 3 // 4:height, 0:width]
+            roi_height, roi_width = roi.shape[:2]
+            
+            # Define the coordinates for the central third of the ROI
+            '''
+            start_x = roi_width // 3
+            end_x = 2 * roi_width // 3
+            
+            # Extract the central third of the ROI without modifying the height
+            center_third_roi = roi[:, start_x:end_x]
+            '''
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+            lower_black = np.array([0,0,0])   # Rango mínimo de color amarillo
+            upper_black = np.array([179,147,90]) #Rango máximo de color amaraillo
+
+            black_mask = cv2.inRange(hsv, lower_black, upper_black)
+            black_mask = cv2.GaussianBlur(black_mask, (7,7), 0)
+            
+            kernel = np.ones((5,5), np.uint8)
+            black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, kernel)
+            black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, kernel)
+            
+            # Encontrar contornos en la imagen
+            contours, _ = cv2.findContours(black_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            if len(contours) > 0:
+                c = max(contours,key=cv2.contourArea)
+                M = cv2.moments(c)
+                if M["m00"] != 0:
+                    cx = int(M["m10"]/M["m00"])
+                    cy = int(M["m01"]/M["m00"])
+                    error_x = cx-120
+                    self.get_logger().info(str(error_x))
+                    if (error_x > -20 and error_x < 20):
+                        msg.linear.x = 0.03
+                        msg.angular.z = 0.0
+                        self.pub.publish(msg)
+                        if (self.zebra == 1 and self.area > 4499) and self.ahead == 1:
+                            msg.linear.x = 0.0
+                            msg.angular.z = 0.0
+                            self.pub.publish(msg)
+                            time.sleep(5)
+                            if self.semaforo_green == 1:
+                                self.print(str(self.ahead))
+                                msg.linear.x = 0.06
+                                msg.angular.z = 0.0
+                                self.pub.publish(msg)
+                                time.sleep(10)
+                                self.ahead, self.semaforo_green, self.zebra = 0
+                            elif self.semaforo_yellow == 1:
+                                self.print(str(self.ahead))
+                                msg.linear.x = 0.025
+                                msg.angular.z = 0.0
+                                self.pub.publish(msg)
+                                time.sleep(10)
+                                self.ahead, self.semaforo_yellow, self.zebra = 0
+                            elif self.semaforo_red == 1:
+                                self.print(str(self.ahead))
+                                msg.linear.x = 0.0
+                                msg.angular.z = 0.0
+                                self.pub.publish(msg)
+                                time.sleep(10)
+                                self.ahead, self.semaforo_red, self.zebra = 0
+                            
+
+                            
+                    elif error_x <-20 and self.zebra == 0:
+                        msg.linear.x = 0.025
+                        msg.angular.z = -error_x*0.009
+                        self.pub.publish(msg)
+                    
+                    elif error_x > 20 and self.zebra == 0:
+                        msg.linear.x = 0.025
+                        msg.angular.z = -error_x*0.009
+                        self.pub.publish(msg)
+                    '''
+                    elif error_x < -50:
+                        msg.linear.x = 0.005
+                        msg.angular.z = -error_x*0.01
+                        self.pub.publish(msg)
+                    elif error_x > 50:
+                        msg.linear.x = 0.005
+                        msg.angular.z = -error_x*0.01
+                        self.pub.publish(msg)
+                    '''
+                    '''
+                    print(str(self.left))
+                    if self.left == 1 and self.semaforo_green == 1:
+                        msg.linear.x = 0.07
+                        msg.angular.z = 0.25
+                        self.pub.publish(msg)
+                        time.sleep(10)
+                        msg.linear.x = 0.0
+                        msg.angular.z = 0.0
+                        self.pub.publish(msg)
+                        time.sleep(10)
+                    '''
+                    cv2.circle(roi,(cx,cy), 5, (0,255,255), -1)
+            else:
+                msg.linear.x = 0.0
+                msg.angular.z = 0.0
+                self.pub.publish(msg)
+            
+            # Dibujar contornos en la imagen original
+            cv2.drawContours(roi, contours, -1, (0, 255, 0), 2)
+            
+            # Mostrar la imagen con los contornos
+            cv2.imshow('Contours', roi)
+            cv2.waitKey(1)
+                    
+def main(args=None):
+    rclpy.init(args=args)
+    nodeh = ColorAndCircleDetection()
+    try: rclpy.spin(nodeh)
+    except Exception as error: print(error)
+    except KeyboardInterrupt: print("Node interrupted")
+
+if __name__ == '__main__':
+    main()
